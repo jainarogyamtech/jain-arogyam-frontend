@@ -1,0 +1,54 @@
+/* General Reset */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Ensuring body takes full height */
+body, html {
+  height: 100%;
+  font-family: Arial, sans-serif;
+}
+
+/* Main wrapper that takes full viewport height */
+.app-container {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh; /* Ensures the container takes full viewport height */
+}
+
+/* Main content */
+main {
+  flex-grow: 1; /* Makes sure the main content takes available space */
+  padding: 20px;
+  overflow-y: auto; /* If content is more, it will be scrollable */
+}
+
+/* Root styles for better centering of the app */
+#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+/* Style for logo (if any) */
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
