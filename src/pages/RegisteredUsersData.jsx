@@ -70,8 +70,7 @@ const getPageWindow = (current, total, siblings = 2) => {
 /* ------------------------------------------------------------------ */
 const escapeCsv = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
 
-/* Columns that should sort as dates rather than text */
-const DATE_KEYS = new Set(["Date_Of_Birth", "createdAt"]);
+const EMPTY_FILTERS = { fromDate: "", toDate: "", mobile: "", name: "" };
 
 const COLUMNS = [
   { label: "Registration No", key: "RegistrationNumber" },
@@ -86,132 +85,79 @@ const COLUMNS = [
 
 const RegisteredUsersData = () => {
   const [users, setUsers] = useState([]);
-  const [fromDate, setFromDate] = useState("");
-  const [toDate, setToDate] = useState("");
+  const [totalUsers, setTotalUsers] = useState(0);
   const [errorMessage, setErrorMessage] = useState("");
   const [loading, setLoading] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
   const [currentPage, setCurrentPage] = useState(1);
   const [itemsPerPage] = useState(10);
   const [sortConfig, setSortConfig] = useState({ key: null, direction: null });
+
+  // Draft inputs, bound directly to the fields. They only take effect (and
+  // trigger a fetch) once Search is clicked — matching AdminDashboard, and
+  // avoiding a server round trip per keystroke.
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
   const [searchMobile, setSearchMobile] = useState("");
   const [searchName, setSearchName] = useState("");
+  const [appliedFilters, setAppliedFilters] = useState(EMPTY_FILTERS);
+
   const navigate = useNavigate();
   const apiUrl = import.meta.env.VITE_API_URL;
 
-  const fetchUsers = async () => {
-    let allUsers = [];
-    let offset   = 0;
-    const limit  = 100;
-    let hasMore  = true;
+  /* ---------------------------------------------------------------- */
+  /*  Server-side pagination — only the current page's records are     */
+  /*  fetched; sorting and filtering happen on the backend. An         */
+  /*  AbortController cancels a stale request if the user pages/sorts  */
+  /*  again before it returns, so responses can't arrive out of order. */
+  /* ---------------------------------------------------------------- */
+  useEffect(() => {
+    const controller = new AbortController();
 
-    try {
-      while (hasMore) {
-        const response = await axios.get(`${apiUrl}/users`, { params: { limit, offset } });
-        const docs = response.data.documents || [];
-        if (docs.length > 0) {
-          allUsers = [...allUsers, ...docs];
-          offset  += docs.length;
-          if (docs.length < limit) hasMore = false;
-        } else {
-          hasMore = false;
-        }
+    const fetchUsers = async () => {
+      try {
+        setLoading(true);
+        setErrorMessage("");
+        const response = await axios.get(`${apiUrl}/users`, {
+          signal: controller.signal,
+          params: {
+            page: currentPage,
+            limit: itemsPerPage,
+            sortKey: sortConfig.key || undefined,
+            sortDir: sortConfig.direction || undefined,
+            mobile: appliedFilters.mobile || undefined,
+            name: appliedFilters.name || undefined,
+            fromDate: appliedFilters.fromDate || undefined,
+            toDate: appliedFilters.toDate || undefined,
+          },
+        });
+        setUsers(response.data.documents || []);
+        setTotalUsers(response.data.total || 0);
+      } catch (error) {
+        if (axios.isCancel(error)) return;
+        console.error("Error fetching users:", error);
+        setErrorMessage("Failed to fetch users data. Please try again later.");
+      } finally {
+        if (!controller.signal.aborted) setLoading(false);
       }
-      setUsers(allUsers);
-    } catch (error) {
-      console.error("Error fetching users:", error);
-      setErrorMessage("Failed to fetch users data. Please try again later.");
-    } finally {
-      setLoading(false);
-    }
+    };
+
+    fetchUsers();
+    return () => controller.abort();
+  }, [apiUrl, currentPage, itemsPerPage, sortConfig, appliedFilters]);
+
+  const handleSearch = (e) => {
+    e.preventDefault();
+    setAppliedFilters({ fromDate, toDate, mobile: searchMobile, name: searchName });
+    setCurrentPage(1);
   };
 
-  useEffect(() => {
-    fetchUsers();
-  }, []);
-
-  /* ---------------------------------------------------------------- */
-  /*  Sorting — applied to the master list, so filtering never wipes   */
-  /*  the sort order. Dates sort as dates, numbers as numbers, and    */
-  /*  text sorts case-insensitively; missing values go last.          */
-  /* ---------------------------------------------------------------- */
-  const sortedUsers = useMemo(() => {
-    const { key, direction } = sortConfig;
-    if (!key || !direction) return users;
-
-    const dir = direction === "asc" ? 1 : -1;
-
-    return [...users].sort((a, b) => {
-      let valA = a[key];
-      let valB = b[key];
-
-      // Missing values always sort to the end
-      const missingA = valA === null || valA === undefined || valA === "";
-      const missingB = valB === null || valB === undefined || valB === "";
-      if (missingA && missingB) return 0;
-      if (missingA) return 1;
-      if (missingB) return -1;
-
-      if (DATE_KEYS.has(key)) {
-        const tA = new Date(valA).getTime();
-        const tB = new Date(valB).getTime();
-        if (!Number.isNaN(tA) && !Number.isNaN(tB)) return (tA - tB) * dir;
-      }
-
-      if (typeof valA === "number" && typeof valB === "number") {
-        return (valA - valB) * dir;
-      }
-
-      return String(valA).localeCompare(String(valB), undefined, {
-        sensitivity: "base",
-        numeric: true, // "REG-9" < "REG-10"
-      }) * dir;
-    });
-  }, [users, sortConfig]);
-
-  /* ---------------------------------------------------------------- */
-  /*  Filtering — ALL filters (date range + mobile + name) combine     */
-  /*  with AND, derived from the sorted master list. End date is      */
-  /*  inclusive of its whole day.                                     */
-  /* ---------------------------------------------------------------- */
-  const filteredUsers = useMemo(() => {
-    const lowerMobile = searchMobile.trim().toLowerCase();
-    const lowerName   = searchName.trim().toLowerCase();
-    const from = fromDate ? new Date(fromDate) : null;
-    const to   = toDate ? new Date(toDate) : null;
-    if (to) to.setHours(23, 59, 59, 999);
-
-    return sortedUsers.filter((user) => {
-      if (lowerMobile && !String(user.MobileNumber || "").toLowerCase().includes(lowerMobile)) {
-        return false;
-      }
-      if (lowerName) {
-        const first = String(user.FirstName || "").toLowerCase();
-        const last  = String(user.LastName || "").toLowerCase();
-        const full  = `${first} ${last}`;
-        if (!first.includes(lowerName) && !last.includes(lowerName) && !full.includes(lowerName)) {
-          return false;
-        }
-      }
-      if (from || to) {
-        const d = new Date(user.createdAt);
-        if (Number.isNaN(d.getTime())) return false;
-        if (from && d < from) return false;
-        if (to && d > to) return false;
-      }
-      return true;
-    });
-  }, [sortedUsers, searchMobile, searchName, fromDate, toDate]);
-
-  // Back to page 1 whenever any filter changes
-  useEffect(() => {
-    setCurrentPage(1);
-  }, [searchMobile, searchName, fromDate, toDate]);
-
   const clearFilters = () => {
-    setSearchMobile("");
-    setSearchName("");
     setFromDate("");
     setToDate("");
+    setSearchMobile("");
+    setSearchName("");
+    setAppliedFilters(EMPTY_FILTERS);
     setCurrentPage(1);
   };
 
@@ -230,40 +176,60 @@ const RegisteredUsersData = () => {
   };
 
   /* -------------------- CSV export (filtered view) ----------------- */
-  const downloadData = () => {
-    const csvHeaders = ["Registration No", "First Name", "Last Name", "Gender", "Email", "Date Of Birth", "Mobile", "Created Date"];
-    const csvContent = [
-      csvHeaders.map(escapeCsv).join(","),
-      ...filteredUsers.map((user) =>
-        [
-          user.RegistrationNumber || "",
-          user.FirstName          || "",
-          user.LastName           || "",
-          user.Gender             || "",
-          user.PatientEmail       || "",
-          user.Date_Of_Birth ? new Date(user.Date_Of_Birth).toLocaleDateString() : "",
-          user.MobileNumber || "",
-          user.createdAt ? new Date(user.createdAt).toLocaleString("en-GB") : "",
-        ].map(escapeCsv).join(",")
-      ),
-    ].join("\n");
+  // Pulls every row matching the current filters from the backend (not just
+  // the loaded page), since the client no longer holds the full dataset.
+  const downloadData = async () => {
+    try {
+      setIsExporting(true);
+      const response = await axios.get(`${apiUrl}/users/export`, {
+        params: {
+          sortKey: sortConfig.key || undefined,
+          sortDir: sortConfig.direction || undefined,
+          mobile: appliedFilters.mobile || undefined,
+          name: appliedFilters.name || undefined,
+          fromDate: appliedFilters.fromDate || undefined,
+          toDate: appliedFilters.toDate || undefined,
+        },
+      });
+      const rows = response.data.documents || [];
 
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url  = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href     = url;
-    link.download = "registered_users_data.csv";
-    link.click();
-    URL.revokeObjectURL(url);
+      const csvHeaders = ["Registration No", "First Name", "Last Name", "Gender", "Email", "Date Of Birth", "Mobile", "Created Date"];
+      const csvContent = [
+        csvHeaders.map(escapeCsv).join(","),
+        ...rows.map((user) =>
+          [
+            user.RegistrationNumber || "",
+            user.FirstName          || "",
+            user.LastName           || "",
+            user.Gender             || "",
+            user.PatientEmail       || "",
+            user.Date_Of_Birth ? new Date(user.Date_Of_Birth).toLocaleDateString() : "",
+            user.MobileNumber || "",
+            user.createdAt ? new Date(user.createdAt).toLocaleString("en-GB") : "",
+          ].map(escapeCsv).join(",")
+        ),
+      ].join("\n");
+
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const url  = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href     = url;
+      link.download = "registered_users_data.csv";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Error exporting users:", error);
+      setErrorMessage("Failed to export users data. Please try again later.");
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   /* ------------------------- Pagination ---------------------------- */
-  const totalPages      = Math.max(1, Math.ceil(filteredUsers.length / itemsPerPage));
-  const safePage        = Math.min(currentPage, totalPages);
-  const currentPageData = filteredUsers.slice((safePage - 1) * itemsPerPage, safePage * itemsPerPage);
-  const pageWindow      = useMemo(() => getPageWindow(safePage, totalPages), [safePage, totalPages]);
-  const rangeStart      = filteredUsers.length === 0 ? 0 : (safePage - 1) * itemsPerPage + 1;
-  const rangeEnd        = Math.min(safePage * itemsPerPage, filteredUsers.length);
+  const totalPages = Math.max(1, Math.ceil(totalUsers / itemsPerPage));
+  const pageWindow = useMemo(() => getPageWindow(currentPage, totalPages), [currentPage, totalPages]);
+  const rangeStart = totalUsers === 0 ? 0 : (currentPage - 1) * itemsPerPage + 1;
+  const rangeEnd   = Math.min(currentPage * itemsPerPage, totalUsers);
 
   return (
     <div className={s.page}>
@@ -274,35 +240,38 @@ const RegisteredUsersData = () => {
           <button onClick={() => navigate("/admin-dashboard")} className={s.btnSuccess}>
             Live Appointment Diary
           </button>
-          <button onClick={downloadData} className={s.btnPrimary}>
-            Download Data
+          <button onClick={downloadData} disabled={isExporting} className={s.btnPrimary}>
+            {isExporting ? "Exporting…" : "Download Data"}
           </button>
         </div>
 
         {errorMessage && <div className={s.errorBox}>{errorMessage}</div>}
 
-        {/* Filters — all combine (date range AND mobile AND name), applied live */}
-        <div className={s.filterRow}>
-          <div className={s.filterGroup}>
-            <label htmlFor="fromDate" className={s.label}>Registered From</label>
-            <input type="date" id="fromDate" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className={s.input} />
+        {/* Filters — all combine (date range AND mobile AND name), applied on Search */}
+        <form onSubmit={handleSearch}>
+          <div className={s.filterRow}>
+            <div className={s.filterGroup}>
+              <label htmlFor="fromDate" className={s.label}>Registered From</label>
+              <input type="date" id="fromDate" value={fromDate} onChange={(e) => setFromDate(e.target.value)} className={s.input} />
+            </div>
+            <div className={s.filterGroup}>
+              <label htmlFor="toDate" className={s.label}>Registered To</label>
+              <input type="date" id="toDate" value={toDate} onChange={(e) => setToDate(e.target.value)} className={s.input} />
+            </div>
+            <div className={s.filterGroup}>
+              <label className={s.label}>&nbsp;</label>
+              <button type="button" onClick={clearFilters} className={s.btnNeutral}>
+                Clear Filters
+              </button>
+            </div>
           </div>
-          <div className={s.filterGroup}>
-            <label htmlFor="toDate" className={s.label}>Registered To</label>
-            <input type="date" id="toDate" value={toDate} onChange={(e) => setToDate(e.target.value)} className={s.input} />
-          </div>
-          <div className={s.filterGroup}>
-            <label className={s.label}>&nbsp;</label>
-            <button onClick={clearFilters} className={s.btnNeutral}>
-              Clear Filters
-            </button>
-          </div>
-        </div>
 
-        <div className={s.filterRow}>
-          <input type="text" value={searchMobile} onChange={(e) => setSearchMobile(e.target.value)} className={s.input} placeholder="Search by Mobile Number..." />
-          <input type="text" value={searchName}   onChange={(e) => setSearchName(e.target.value)}   className={s.input} placeholder="Search by Name (First/Last)..." />
-        </div>
+          <div className={s.filterRow}>
+            <input type="text" value={searchMobile} onChange={(e) => setSearchMobile(e.target.value)} className={s.input} placeholder="Search by Mobile Number..." />
+            <input type="text" value={searchName}   onChange={(e) => setSearchName(e.target.value)}   className={s.input} placeholder="Search by Name (First/Last)..." />
+            <button type="submit" className={s.btnPrimary}>Search</button>
+          </div>
+        </form>
 
         {loading && (
           <div className={s.loadingWrap}>
@@ -325,8 +294,11 @@ const RegisteredUsersData = () => {
                   </tr>
                 </thead>
                 <tbody>
-                  {currentPageData.map((user) => (
-                    <tr key={user._id} className={s.row}>
+                  {users.map((user) => (
+                    // Some legacy records (migrated from Appwrite) have a malformed
+                    // string _id that Mongoose can't cast, hydrating as undefined —
+                    // RegistrationNumber is the guaranteed-unique fallback.
+                    <tr key={user._id || user.RegistrationNumber} className={s.row}>
                       <td className={s.td}>{user.RegistrationNumber || "N/A"}</td>
                       <td className={s.td}>{user.FirstName          || "N/A"}</td>
                       <td className={s.td}>{user.LastName           || "N/A"}</td>
@@ -344,7 +316,7 @@ const RegisteredUsersData = () => {
                 </tbody>
               </table>
 
-              {filteredUsers.length === 0 && (
+              {users.length === 0 && (
                 <div className={s.emptyState}>No users match the current filters.</div>
               )}
             </div>
@@ -352,13 +324,13 @@ const RegisteredUsersData = () => {
             {/* Pagination — windowed, never overflows */}
             <div className={s.pagerBar}>
               <span className={s.pagerInfo}>
-                Showing {rangeStart}–{rangeEnd} of {filteredUsers.length} users
+                Showing {rangeStart}–{rangeEnd} of {totalUsers} users
               </span>
 
               <nav className={s.pagerNav} aria-label="Pagination">
                 <button
                   className={s.pageEdge}
-                  disabled={safePage === 1}
+                  disabled={currentPage === 1}
                   onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
                 >
                   Previous
@@ -371,8 +343,8 @@ const RegisteredUsersData = () => {
                     <button
                       key={page}
                       onClick={() => setCurrentPage(page)}
-                      className={page === safePage ? s.pageBtnOn : s.pageBtn}
-                      aria-current={page === safePage ? "page" : undefined}
+                      className={page === currentPage ? s.pageBtnOn : s.pageBtn}
+                      aria-current={page === currentPage ? "page" : undefined}
                     >
                       {page}
                     </button>
@@ -381,7 +353,7 @@ const RegisteredUsersData = () => {
 
                 <button
                   className={s.pageEdge}
-                  disabled={safePage >= totalPages}
+                  disabled={currentPage >= totalPages}
                   onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
                 >
                   Next

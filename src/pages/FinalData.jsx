@@ -70,10 +70,7 @@ const getPageWindow = (current, total, siblings = 2) => {
 /* ------------------------------------------------------------------ */
 const escapeCsv = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
 
-/* Per-type sorting hints */
-const DATE_KEYS    = new Set(["AppointmentDates"]);
-const NUMBER_KEYS  = new Set(["Payment", "RemainingSessions"]);
-const BOOLEAN_KEYS = new Set(["PackagePurchased", "PaymentReceived"]);
+const EMPTY_FILTERS = { startDate: "", endDate: "", regNumber: "", name: "" };
 
 const COLUMNS = [
   { key: "RegistrationNumber", label: "Registration Number" },
@@ -91,117 +88,76 @@ const COLUMNS = [
 ];
 
 const FinalData = () => {
-  const [allPatients, setAllPatients] = useState([]); // full dataset from the API
-  const [startDate, setStartDate] = useState("");
-  const [endDate, setEndDate] = useState("");
-  const [registrationSearch, setRegistrationSearch] = useState("");
-  const [nameSearch, setNameSearch] = useState("");
+  const [patients, setPatients] = useState([]); // current page only
+  const [totalPatients, setTotalPatients] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
   const [sortConfig, setSortConfig] = useState({ key: null, direction: null });
   const [currentPage, setCurrentPage] = useState(1);
   const [patientsPerPage] = useState(10);
 
+  // Draft inputs, bound directly to the fields. They only take effect (and
+  // trigger a fetch) once Search is clicked, avoiding a server round trip
+  // per keystroke.
+  const [startDate, setStartDate] = useState("");
+  const [endDate, setEndDate] = useState("");
+  const [registrationSearch, setRegistrationSearch] = useState("");
+  const [nameSearch, setNameSearch] = useState("");
+  const [appliedFilters, setAppliedFilters] = useState(EMPTY_FILTERS);
+
   const apiUrl = import.meta.env.VITE_API_URL;
 
-  // Fetch once; filtering happens client-side so it works even if the
-  // backend ignores the query params.
-  const fetchFinalizedPatients = async () => {
-    try {
-      setIsLoading(true);
-      const response = await axios.get(`${apiUrl}/finalized`);
-      setAllPatients(response.data.documents || []);
-    } catch (error) {
-      console.error("Error fetching finalized patients:", error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
+  /* ---------------------------------------------------------------- */
+  /*  Server-side pagination — only the current page's records are     */
+  /*  fetched; sorting and filtering happen on the backend. An         */
+  /*  AbortController cancels a stale request if the user pages/sorts  */
+  /*  again before it returns, so responses can't arrive out of order. */
+  /* ---------------------------------------------------------------- */
   useEffect(() => {
+    const controller = new AbortController();
+
+    const fetchFinalizedPatients = async () => {
+      try {
+        setIsLoading(true);
+        const response = await axios.get(`${apiUrl}/finalized`, {
+          signal: controller.signal,
+          params: {
+            page: currentPage,
+            limit: patientsPerPage,
+            sortKey: sortConfig.key || undefined,
+            sortDir: sortConfig.direction || undefined,
+            regNumber: appliedFilters.regNumber || undefined,
+            name: appliedFilters.name || undefined,
+            startDate: appliedFilters.startDate || undefined,
+            endDate: appliedFilters.endDate || undefined,
+          },
+        });
+        setPatients(response.data.documents || []);
+        setTotalPatients(response.data.total || 0);
+      } catch (error) {
+        if (axios.isCancel(error)) return;
+        console.error("Error fetching finalized patients:", error);
+      } finally {
+        if (!controller.signal.aborted) setIsLoading(false);
+      }
+    };
+
     fetchFinalizedPatients();
-  }, []);
+    return () => controller.abort();
+  }, [apiUrl, currentPage, patientsPerPage, sortConfig, appliedFilters]);
 
-  /* ---------------------------------------------------------------- */
-  /*  Sorting — derived, never mutates the fetched data. Dates sort    */
-  /*  as dates, numbers as numbers, checkboxes as yes/no, and text    */
-  /*  case-insensitively; missing values always sink to the bottom.   */
-  /* ---------------------------------------------------------------- */
-  const sortedPatients = useMemo(() => {
-    const { key, direction } = sortConfig;
-    if (!key || !direction) return allPatients;
-
-    const dir = direction === "asc" ? 1 : -1;
-
-    return [...allPatients].sort((a, b) => {
-      const valA = a[key];
-      const valB = b[key];
-
-      if (BOOLEAN_KEYS.has(key)) {
-        return ((valA === true ? 1 : 0) - (valB === true ? 1 : 0)) * dir;
-      }
-
-      // Missing values always sort to the end
-      const missingA = valA === null || valA === undefined || valA === "";
-      const missingB = valB === null || valB === undefined || valB === "";
-      if (missingA && missingB) return 0;
-      if (missingA) return 1;
-      if (missingB) return -1;
-
-      if (DATE_KEYS.has(key)) {
-        const tA = new Date(valA).getTime();
-        const tB = new Date(valB).getTime();
-        if (!Number.isNaN(tA) && !Number.isNaN(tB)) return (tA - tB) * dir;
-      }
-
-      if (NUMBER_KEYS.has(key)) {
-        const nA = Number(valA);
-        const nB = Number(valB);
-        if (!Number.isNaN(nA) && !Number.isNaN(nB)) return (nA - nB) * dir;
-      }
-
-      return String(valA).localeCompare(String(valB), undefined, {
-        sensitivity: "base",
-        numeric: true, // "JAP-9" < "JAP-10"
-      }) * dir;
-    });
-  }, [allPatients, sortConfig]);
-
-  /* ---------------------------------------------------------------- */
-  /*  Client-side filtering — recomputed whenever data or any filter   */
-  /*  changes. Date range is inclusive of the end date's full day.    */
-  /* ---------------------------------------------------------------- */
-  const filteredPatients = useMemo(() => {
-    const reg  = registrationSearch.trim().toLowerCase();
-    const name = nameSearch.trim().toLowerCase();
-    const from = startDate ? new Date(startDate) : null;
-    const to   = endDate ? new Date(endDate) : null;
-    if (to) to.setHours(23, 59, 59, 999); // include the whole end day
-
-    return sortedPatients.filter((p) => {
-      if (reg && !String(p.RegistrationNumber || "").toLowerCase().includes(reg)) return false;
-      if (name && !String(p.PatientName || "").toLowerCase().includes(name)) return false;
-
-      if (from || to) {
-        if (!p.AppointmentDates) return false;
-        const d = new Date(p.AppointmentDates);
-        if (Number.isNaN(d.getTime())) return false;
-        if (from && d < from) return false;
-        if (to && d > to) return false;
-      }
-      return true;
-    });
-  }, [sortedPatients, registrationSearch, nameSearch, startDate, endDate]);
-
-  // Land back on page 1 whenever the filters change
-  useEffect(() => {
+  const handleSearch = (e) => {
+    e.preventDefault();
+    setAppliedFilters({ startDate, endDate, regNumber: registrationSearch, name: nameSearch });
     setCurrentPage(1);
-  }, [registrationSearch, nameSearch, startDate, endDate]);
+  };
 
   const clearFilters = () => {
     setStartDate("");
     setEndDate("");
     setRegistrationSearch("");
     setNameSearch("");
+    setAppliedFilters(EMPTY_FILTERS);
     setCurrentPage(1);
   };
 
@@ -216,58 +172,74 @@ const FinalData = () => {
   };
 
   /* ------------------------- Pagination ---------------------------- */
-  const totalPages      = Math.max(1, Math.ceil(filteredPatients.length / patientsPerPage));
-  const safePage        = Math.min(currentPage, totalPages);
-  const currentPatients = filteredPatients.slice(
-    (safePage - 1) * patientsPerPage,
-    safePage * patientsPerPage
-  );
-  const pageWindow = useMemo(() => getPageWindow(safePage, totalPages), [safePage, totalPages]);
-  const rangeStart = filteredPatients.length === 0 ? 0 : (safePage - 1) * patientsPerPage + 1;
-  const rangeEnd   = Math.min(safePage * patientsPerPage, filteredPatients.length);
+  const totalPages = Math.max(1, Math.ceil(totalPatients / patientsPerPage));
+  const pageWindow = useMemo(() => getPageWindow(currentPage, totalPages), [currentPage, totalPages]);
+  const rangeStart = totalPatients === 0 ? 0 : (currentPage - 1) * patientsPerPage + 1;
+  const rangeEnd   = Math.min(currentPage * patientsPerPage, totalPatients);
 
   const paginate       = (n) => setCurrentPage(n);
   const handlePrevPage = () => setCurrentPage((p) => Math.max(1, p - 1));
   const handleNextPage = () => setCurrentPage((p) => Math.min(totalPages, p + 1));
 
   /* -------------------- CSV export (filtered view) ----------------- */
+  // Pulls every row matching the current filters from the backend (not just
+  // the loaded page), since the client no longer holds the full dataset.
   // ?? keeps real zeros (Payment: 0, RemainingSessions: 0), and
   // checkbox fields export as explicit Yes/No instead of vanishing
   // when false.
-  const downloadData = () => {
-    const csvHeaders = [
-      "Registration Number", "Appointment Date", "Patient Name", "Patient Problem",
-      "Doctor Attended", "Treatment Done", "Package Purchased",
-      "Remaining Sessions", "Payment Received", "Payment", "Payment Mode", "Remarks",
-    ];
+  const downloadData = async () => {
+    try {
+      setIsExporting(true);
+      const response = await axios.get(`${apiUrl}/finalized/export`, {
+        params: {
+          sortKey: sortConfig.key || undefined,
+          sortDir: sortConfig.direction || undefined,
+          regNumber: appliedFilters.regNumber || undefined,
+          name: appliedFilters.name || undefined,
+          startDate: appliedFilters.startDate || undefined,
+          endDate: appliedFilters.endDate || undefined,
+        },
+      });
+      const rows = response.data.documents || [];
 
-    const csvContent = [
-      csvHeaders.map(escapeCsv).join(","),
-      ...filteredPatients.map((p) =>
-        [
-          p.RegistrationNumber ?? "",
-          p.AppointmentDates ? new Date(p.AppointmentDates).toLocaleDateString() : "N/A",
-          p.PatientName    ?? "",
-          p.PatientProblem ?? "",
-          p.DoctorAttended ?? "",
-          p.TreatmentDone  ?? "",
-          p.PackagePurchased === true ? "Yes" : "No",
-          p.RemainingSessions ?? "",
-          p.PaymentReceived === true ? "Yes" : "No",
-          p.Payment     ?? "",
-          p.PaymentMode ?? "",
-          p.Remarks     ?? "",
-        ].map(escapeCsv).join(",")
-      ),
-    ].join("\n");
+      const csvHeaders = [
+        "Registration Number", "Appointment Date", "Patient Name", "Patient Problem",
+        "Doctor Attended", "Treatment Done", "Package Purchased",
+        "Remaining Sessions", "Payment Received", "Payment", "Payment Mode", "Remarks",
+      ];
 
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url  = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href     = url;
-    link.download = "finalized_patients_data.csv";
-    link.click();
-    URL.revokeObjectURL(url);
+      const csvContent = [
+        csvHeaders.map(escapeCsv).join(","),
+        ...rows.map((p) =>
+          [
+            p.RegistrationNumber ?? "",
+            p.AppointmentDates ? new Date(p.AppointmentDates).toLocaleDateString() : "N/A",
+            p.PatientName    ?? "",
+            p.PatientProblem ?? "",
+            p.DoctorAttended ?? "",
+            p.TreatmentDone  ?? "",
+            p.PackagePurchased === true ? "Yes" : "No",
+            p.RemainingSessions ?? "",
+            p.PaymentReceived === true ? "Yes" : "No",
+            p.Payment     ?? "",
+            p.PaymentMode ?? "",
+            p.Remarks     ?? "",
+          ].map(escapeCsv).join(",")
+        ),
+      ].join("\n");
+
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const url  = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href     = url;
+      link.download = "finalized_patients_data.csv";
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error("Error exporting finalized patients:", error);
+    } finally {
+      setIsExporting(false);
+    }
   };
 
   return (
@@ -284,8 +256,8 @@ const FinalData = () => {
           </Link>
         </div>
 
-        {/* Filters — apply instantly as you type / pick dates */}
-        <div className={s.filterRow}>
+        {/* Filters — apply when Search is clicked */}
+        <form onSubmit={handleSearch} className={s.filterRow}>
           <div className={s.filterGroup}>
             <label htmlFor="startDate" className={s.label}>Start Date</label>
             <input type="date" id="startDate" value={startDate} onChange={(e) => setStartDate(e.target.value)} className={s.input} />
@@ -302,13 +274,16 @@ const FinalData = () => {
             <label htmlFor="nameSearch" className={s.label}>Patient Name</label>
             <input type="text" id="nameSearch" value={nameSearch} onChange={(e) => setNameSearch(e.target.value)} className={s.input} placeholder="Type to search…" />
           </div>
-          <button onClick={clearFilters} className={s.btnClear}>
+          <button type="submit" className={s.btnClear}>
+            Search
+          </button>
+          <button type="button" onClick={clearFilters} className={s.btnClear}>
             Clear Filters
           </button>
-        </div>
+        </form>
 
-        <button onClick={downloadData} className={s.btnDownload}>
-          Download Data
+        <button onClick={downloadData} disabled={isExporting} className={s.btnDownload}>
+          {isExporting ? "Exporting…" : "Download Data"}
         </button>
 
         {isLoading ? (
@@ -329,33 +304,34 @@ const FinalData = () => {
                 </tr>
               </thead>
               <tbody>
-                {currentPatients.length > 0 ? (
-                  currentPatients.map((patient) => (
-                    <tr key={patient._id} className={s.row}>
-                      {COLUMNS.map(({ key: field }) => (
-                        <td key={field} className={s.td}>
-                          {field === "AppointmentDates" ? (
-                            patient[field] ? new Date(patient[field]).toLocaleDateString() : "N/A"
-                          ) : field === "PackagePurchased" || field === "PaymentReceived" ? (
-                            <input type="checkbox" checked={patient[field] === true} disabled className={s.checkbox} />
-                          ) : field === "Payment" || field === "RemainingSessions" ? (
-                            patient[field] ?? "N/A" // keep real zeros visible
-                          ) : (
-                            patient[field] || "N/A"
-                          )}
-                        </td>
-                      ))}
-                    </tr>
-                  ))
-                ) : (
-                  <tr>
-                    <td colSpan={COLUMNS.length} className={s.emptyCell}>
-                      No records found. Try widening the date range or clearing a filter.
-                    </td>
+                {patients.map((patient) => (
+                  // Some legacy records (migrated from Appwrite) have a malformed
+                  // string _id that Mongoose can't cast, hydrating as undefined —
+                  // RegistrationNumber is the guaranteed-unique fallback.
+                  <tr key={patient._id || patient.RegistrationNumber} className={s.row}>
+                    {COLUMNS.map(({ key: field }) => (
+                      <td key={field} className={s.td}>
+                        {field === "AppointmentDates" ? (
+                          patient[field] ? new Date(patient[field]).toLocaleDateString() : "N/A"
+                        ) : field === "PackagePurchased" || field === "PaymentReceived" ? (
+                          <input type="checkbox" checked={patient[field] === true} disabled className={s.checkbox} />
+                        ) : field === "Payment" || field === "RemainingSessions" ? (
+                          patient[field] ?? "N/A" // keep real zeros visible
+                        ) : (
+                          patient[field] || "N/A"
+                        )}
+                      </td>
+                    ))}
                   </tr>
-                )}
+                ))}
               </tbody>
             </table>
+
+            {patients.length === 0 && (
+              <div className={s.emptyCell}>
+                No records found. Try widening the date range or clearing a filter.
+              </div>
+            )}
           </div>
         )}
 
@@ -363,11 +339,11 @@ const FinalData = () => {
         {!isLoading && (
           <div className={s.pagerBar}>
             <span className={s.pagerInfo}>
-              Showing {rangeStart}–{rangeEnd} of {filteredPatients.length} records
+              Showing {rangeStart}–{rangeEnd} of {totalPatients} records
             </span>
 
             <nav className={s.pagerNav} aria-label="Pagination">
-              <button onClick={handlePrevPage} disabled={safePage === 1} className={s.pageEdge}>
+              <button onClick={handlePrevPage} disabled={currentPage === 1} className={s.pageEdge}>
                 Prev
               </button>
 
@@ -378,15 +354,15 @@ const FinalData = () => {
                   <button
                     key={page}
                     onClick={() => paginate(page)}
-                    className={page === safePage ? s.pageBtnOn : s.pageBtn}
-                    aria-current={page === safePage ? "page" : undefined}
+                    className={page === currentPage ? s.pageBtnOn : s.pageBtn}
+                    aria-current={page === currentPage ? "page" : undefined}
                   >
                     {page}
                   </button>
                 )
               )}
 
-              <button onClick={handleNextPage} disabled={safePage >= totalPages} className={s.pageEdge}>
+              <button onClick={handleNextPage} disabled={currentPage >= totalPages} className={s.pageEdge}>
                 Next
               </button>
             </nav>

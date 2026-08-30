@@ -75,9 +75,23 @@ const getPageWindow = (current, total, siblings = 2) => {
 };
 
 /* Per-type sorting hints */
-const DATE_KEYS    = new Set(["AppointmentDate"]);
+const DATE_KEYS    = new Set(["AppointmentDate", "AppointmentTime"]);
 const NUMBER_KEYS  = new Set(["Payment", "RemainingSessions"]);
 const BOOLEAN_KEYS = new Set(["PackagePurchased", "PaymentReceived"]);
+
+/* AppointmentTime is a virtual column: there's no separate time field in
+   the DB, it's read out of / written back into AppointmentDate (already a
+   full datetime under the hood). */
+const getDatePart = (v) =>
+  v && !Number.isNaN(new Date(v).getTime()) ? new Date(v).toISOString().slice(0, 10) : "";
+const getTimePart = (v) =>
+  v && !Number.isNaN(new Date(v).getTime()) ? new Date(v).toISOString().slice(11, 16) : "";
+const combineDateTime = (datePart, timePart) => {
+  if (!datePart && !timePart) return null;
+  const d = datePart || new Date().toISOString().slice(0, 10);
+  const t = timePart || "00:00";
+  return new Date(`${d}T${t}:00.000Z`).toISOString();
+};
 
 /* RemainingSessions column added — it was editable in code and sent on
    finalize, but had no column, so staff could never actually set it and
@@ -85,6 +99,7 @@ const BOOLEAN_KEYS = new Set(["PackagePurchased", "PaymentReceived"]);
 const HEADERS = [
   { label: "Registration Number", field: "RegistrationNumber" },
   { label: "Appointment Date",    field: "AppointmentDate" },
+  { label: "Appointment Time",    field: "AppointmentTime" },
   { label: "Patient Name",        field: "PatientName" },
   { label: "Patient Problem",     field: "PatientProblem" },
   { label: "Doctor Attended",     field: "DoctorAttended" },
@@ -103,7 +118,15 @@ const TEXT_CELLS = [
     field: "AppointmentDate",
     type: "date",
     minWidth: "150px",
-    formatValue: (v) => (v ? new Date(v).toISOString().slice(0, 10) : ""),
+    formatValue: (v) => getDatePart(v),
+    onValueChange: (patient, value) => combineDateTime(value, getTimePart(patient.AppointmentDate)),
+  },
+  {
+    field: "AppointmentTime",
+    type: "time",
+    minWidth: "110px",
+    formatValue: (_v, patient) => getTimePart(patient.AppointmentDate),
+    onValueChange: (patient, value) => combineDateTime(getDatePart(patient.AppointmentDate), value),
   },
   { field: "PatientName",    type: "text", minWidth: "250px" },
   { field: "PatientProblem", type: "text", minWidth: "300px" },
@@ -185,8 +208,8 @@ const AdminDashboard = () => {
     const dir = direction === "asc" ? 1 : -1;
 
     return [...patients].sort((a, b) => {
-      const valA = a[field];
-      const valB = b[field];
+      const valA = field === "AppointmentTime" ? a.AppointmentDate : a[field];
+      const valB = field === "AppointmentTime" ? b.AppointmentDate : b[field];
 
       if (BOOLEAN_KEYS.has(field)) {
         return ((valA === true ? 1 : 0) - (valB === true ? 1 : 0)) * dir;
@@ -444,12 +467,18 @@ const AdminDashboard = () => {
                 {displayedPatients.length > 0 ? (
                   displayedPatients.map((patient) => (
                     <tr key={patient._id} className={s.row}>
-                      {TEXT_CELLS.map(({ field, type, minWidth, formatValue }) => (
+                      {TEXT_CELLS.map(({ field, type, minWidth, formatValue, onValueChange }) => (
                         <td key={`${patient._id}-${field}`} className={s.td} style={{ minWidth }}>
                           <input
                             type={type}
-                            value={formatValue ? formatValue(patient[field]) : patient[field] || ""}
-                            onChange={(e) => handleFieldChange(patient._id, field, e.target.value)}
+                            value={formatValue ? formatValue(patient[field], patient) : patient[field] || ""}
+                            onChange={(e) => {
+                              if (onValueChange) {
+                                handleFieldChange(patient._id, "AppointmentDate", onValueChange(patient, e.target.value));
+                              } else {
+                                handleFieldChange(patient._id, field, e.target.value);
+                              }
+                            }}
                             className={s.cellInput}
                           />
                         </td>
